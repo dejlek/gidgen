@@ -15,7 +15,7 @@ import gir.type_node;
 import std_includes;
 import xml_patch;
 
-import config;
+import pkgver;
 
 int main(string[] args)
 {
