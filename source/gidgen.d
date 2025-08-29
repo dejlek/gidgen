@@ -15,8 +15,7 @@ import gir.type_node;
 import std_includes;
 import xml_patch;
 
-// Before making a new release remove the '-alpha'
-enum __PROJECT_VERSION__ = "0.9.8-alpha";
+import config;
 
 int main(string[] args)
 {
@@ -62,7 +61,7 @@ int main(string[] args)
 
     if (helpInformation.helpWanted)
     {
-      writeln("gidgen v" ~ __PROJECT_VERSION__);
+      writeln("gidgen v" ~ packageVersion);
       defaultGetoptPrinter("GObject Introspection Dlang binding generator", helpInformation.options);
       return 0;
     }
@@ -86,7 +85,7 @@ int main(string[] args)
     }
 
     if (displayVersion) {
-      writeln("gidgen v" ~ __PROJECT_VERSION__);
+      writeln("gidgen v" ~ packageVersion);
       writeln("Copyright (c) 2024-2025 Kymorphia, PBC");
       return 0;
     }
