@@ -15,7 +15,11 @@ import gir.type_node;
 import std_includes;
 import xml_patch;
 
-import pkgver;
+version (RELEASE_BUILD) {
+  enum packageVersion = "0.9.7";
+} else {
+  import locver; // contains DUB-generated packageVersion
+}
 
 int main(string[] args)
 {
