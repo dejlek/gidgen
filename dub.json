@@ -7,6 +7,6 @@
   "targetType": "executable",
   "mainSourceFile": "source/gidgen.d",
   "preGenerateCommands": [
-    "echo \"module pkgver;\nenum packageVersion=\\\"${DUB_PACKAGE_VERSION}\\\";\" > source/pkgver.d"
+    "echo \"module locver;\n\nenum packageVersion = \\\"${DUB_PACKAGE_VERSION}\\\";\" > source/locver.d"
   ]
 }
