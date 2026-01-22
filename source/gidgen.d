@@ -1,6 +1,6 @@
 module gidgen;
 
-import std.experimental.logger;
+import std.logger;
 import std.getopt;
 import std.path : absolutePath, asNormalizedPath;
 import std.stdio : writeln;
