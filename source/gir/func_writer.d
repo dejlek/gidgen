@@ -545,10 +545,10 @@ class FuncWriter
     final switch (elemType.kind) with (TypeKind)
     {
       case Basic, BasicAlias, Enum, Flags, StructAlias, Struct, Pointer:
-        preCall ~= "auto _" ~ param.dName ~ " = cast(" ~ param.cType ~ ")"
+        preCall ~= "auto _" ~ param.dName ~ " = " ~ param.dName ~ ".ptr ? cast(" ~ param.cType ~ ")"
           ~ (param.zeroTerminated // If zero terminated, append a null or 0 value to the array and use the pointer to pass to the C function call
             ? ("(" ~ param.dName ~ " ~ " ~ (elemType.cType.endsWith("*") ? "null" : elemType.cType ~ ".init") ~ ").ptr")
-            : param.dName ~ ".ptr") ~ ";";
+            : param.dName ~ ".ptr") ~ " : [" ~ elemType.cType ~ ".init].ptr;";
         break;
       case String:
         preCall ~= [elemType.cType ~ "[] _tmp" ~ param.dName ~ ";", "foreach (s; " ~ param.dName ~ ")",
