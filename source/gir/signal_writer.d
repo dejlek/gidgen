@@ -76,7 +76,8 @@ class SignalWriter
       ~ signal.fullDName.to!string);
 
     with (TypeKind) callbackTypes ~= CallbackType(retVal.fullDType, retVal.kind.among(Object, Interface) != 0);
-    call ~= "auto _retval = ";
+    preCall ~= retVal.fullDType ~ " _retval;";
+    call ~= "_retval = ";
     postCall ~= ["", "setVal!(" ~ retVal.fullDType ~ ")(_returnValue, _retval);"];
   }
 
@@ -110,24 +111,26 @@ class SignalWriter
 
     auto cbIndex = cast(int)callbackTypes.length - 1;
 
-    if (param.direction == ParamDirection.In)
+    if (param.isBorrowedArg) // Borrowed for the duration of the signal emission (no owner, not copied)
+      preCall ~= ["", "static if (Parameters!T.length > " ~ cbIndex.to!dstring ~ ")", "{",
+        "auto _" ~ param.dName ~ " = getVal!(void*)(&_paramVals[" ~ (paramIndex + 1).to!dstring ~ "]);",
+        "_paramTuple[" ~ cbIndex.to!dstring ~ "] = _" ~ param.dName ~ " ? new " ~ param.fullDType ~ "(_"
+        ~ param.dName ~ ", null) : null;", "}"];
+    else if (param.direction == ParamDirection.In)
       preCall ~= ["", "static if (Parameters!T.length > " ~ cbIndex.to!dstring ~ ")", // Only process parameters which are included in the callback
         "_paramTuple[" ~ cbIndex.to!dstring ~ "] = getVal!(Parameters!T[" ~ cbIndex.to!dstring
         ~ "])(&_paramVals[" ~ (paramIndex + 1).to!dstring ~ "]);"]; // The parameter index is +1 because the first one is the object instance
     else // Out or InOut parameter?
-    { // De-referenced value pointer (gpointer GValue)
-      auto pointerParam = "*getVal!(Parameters!T[" ~ cbIndex.to!dstring ~ "]*)(&_paramVals["
-        ~ (paramIndex + 1).to!dstring ~ "])";
+    {
+      auto cb = cbIndex.to!dstring;
+      auto ptrExpr = "getVal!(Parameters!T[" ~ cb ~ "]*)(&_paramVals[" ~ (paramIndex + 1).to!dstring ~ "])";
 
-      // Create variable for Out or InOut direction to pass to delegate
-      preCall ~= ["", "Parameters!T[" ~ cbIndex.to!dstring ~ "] " ~ param.dName
-        ~ (param.direction == ParamDirection.InOut ? (" = " ~ pointerParam ~ ";") : ";")]; // Assign GValue to variable if InOut
+      if (param.direction == ParamDirection.InOut)
+        preCall ~= ["", "static if (Parameters!T.length > " ~ cb ~ ")", "{",
+          "if (auto _p = " ~ ptrExpr ~ ")", "_paramTuple[" ~ cb ~ "] = *_p;", "}"];
 
-      preCall ~= ["", "static if (Parameters!T.length > " ~ cbIndex.to!dstring ~ ")", // Only process parameters which are included in the callback
-        "_paramTuple[" ~ cbIndex.to!dstring ~ "] = " ~ param.dName ~ ";"]; // The parameter index is +1 because the first one is the object instance
-
-      postCall ~= ["", "static if (Parameters!T.length > " ~ cbIndex.to!dstring ~ ")", pointerParam ~ " = "
-        ~ param.dName ~ ";"];
+      postCall ~= ["", "static if (Parameters!T.length > " ~ cb ~ ")", "{",
+        "if (auto _p = " ~ ptrExpr ~ ")", "*_p = _paramTuple[" ~ cb ~ "];", "}"];
     }
 
     with (TypeKind) callbackTypes ~= CallbackType(param.fullDType, param.kind.among(Object, Interface) != 0,
@@ -163,8 +166,15 @@ class SignalWriter
       return;
     }
 
+    dstring cArrayType;
+
+    with (TypeKind) if (elemType.kind.among(String, Object, Interface)) // Array of pointers, element cType may or may not have the '*'
+      cArrayType = elemType.cTypeRemPtr ~ "**";
+    else // Array of values (Basic, Enum, Flags, Pointer, inline structs)
+      cArrayType = elemType.cType ~ "*";
+
     inpProcess ~= ["", "static if (Parameters!T.length > " ~ cbIndex.to!dstring ~ ")", // Only process parameters which are included in the callback
-      "{", "auto _cArray = getVal!(" ~ elemType.cTypeRemPtr ~ "**)(&_paramVals[" ~ (paramIndex + 1).to!dstring // The parameter index is +1 because the first one is the object instance
+      "{", "auto _cArray = getVal!(" ~ cArrayType ~ ")(&_paramVals[" ~ (paramIndex + 1).to!dstring // The parameter index is +1 because the first one is the object instance
       ~ "]);", elemType.fullDType ~ "[] _dArray;"];
 
     with (TypeKind) callbackTypes ~= CallbackType(param.fullDType, elemType.kind.among(Object, Interface) != 0,
@@ -181,8 +191,10 @@ class SignalWriter
         lengthStr = param.fixedSize.to!dstring;
       else if (param.zeroTerminated) // Array is zero terminated?
       {
-        inpProcess ~= ["uint _len" ~ param.dName ~ ";", "if (_cArray)", "for (; _cArray" ~ "[_len" ~ param.dName ~ "] "
-          ~ (elemType.cType.endsWith("*") ? "!is null"d : "!= 0") ~ "; _len" ~ param.dName ~ "++)", "break;"];
+        auto termCheck = elemType.kind.among(TypeKind.String, TypeKind.Object, TypeKind.Interface)
+          || elemType.cType.endsWith("*") ? "!is null"d : "!= 0";
+        inpProcess ~= ["uint _len" ~ param.dName ~ ";", "if (_cArray)", "{", "for (; _cArray" ~ "[_len" ~ param.dName
+          ~ "] " ~ termCheck ~ "; _len" ~ param.dName ~ "++)", "{", "}", "}", ""];
         lengthStr = "_len" ~ param.dName;
       }
       else
@@ -194,26 +206,21 @@ class SignalWriter
           inpProcess ~= "_dArray = cast(" ~ elemType.fullDType ~ "[])_cArray[0 .. " ~ lengthStr ~ "];";
           break;
         case String:
-          inpProcess ~= ["foreach (i; 0 .. " ~ lengthStr ~ ")", "_dArray ~= _cArray[i].fromCString("
+          inpProcess ~= ["foreach (i; 0 .. " ~ lengthStr ~ ")", "_dArray ~= _cArray[i].fromCString!("
             ~ param.fullOwnerFlag ~ ".Free);"];
-          break;
-        case Opaque, Boxed, Wrap, Reffed:
-          inpProcess ~= ["foreach (i; 0 .. " ~ lengthStr ~ ")", "_dArray ~= new " ~ elemType.fullDType ~ "(cast("
-            ~ elemType.cType.stripConst ~ "*)&_cArray[i]" ~ (param.kind != Wrap ? (", " ~ param.fullOwnerFlag
-            ~ ".Take") : "") ~ ");"];
           break;
         case Object, Interface:
           addImport("gobject.object");
           inpProcess ~= ["foreach (i; 0 .. " ~ lengthStr ~ ")", "_dArray ~= gobject.object.ObjectWrap._getDObject!("
             ~ elemType.fullDType ~ ")(_cArray[i], " ~ param.fullOwnerFlag ~ ".Take);"];
           break;
-        case Unknown, Callback, Container, Namespace:
+        case Opaque, Boxed, Wrap, Reffed, Unknown, Callback, Container, Namespace:
           assert(0, "Unsupported parameter array type '" ~ elemType.fullDType.to!string ~ "' (" ~ elemType.kind.to!string
               ~ ") for signal " ~ signal.fullDName.to!string);
       }
     }
 
-    inpProcess ~= ["_paramTuple[" ~ paramIndex.to!dstring ~ "] = _dArray;", "}"];
+    inpProcess ~= ["_paramTuple[" ~ cbIndex.to!dstring ~ "] = _dArray;", "}"];
     callbackProto ~= (callbackProto[$ - 1] != '(' ? ", "d : "") ~ param.directionStr ~ param.fullDType
       ~ " " ~ param.dName;
   }
@@ -236,7 +243,7 @@ class SignalWriter
     switch (param.containerType) with(ContainerType)
     {
       case ByteArray:
-        templateParams = param.ownership.to!dstring;
+        templateParams = "GidOwnership." ~ param.ownership.to!dstring;
         break;
       case ArrayG, PtrArray, List, SList:
         templateParams = param.elemTypes[0].fullDType  ~ ", " ~ "GidOwnership." ~ param.ownership.to!dstring;
@@ -250,7 +257,7 @@ class SignalWriter
           ~ param.fullDName.to!string);
     }
 
-    preCall ~= "_paramTuple[" ~ paramIndex.to!dstring ~ "] = g" ~ param.containerType.to!dstring ~ "ToD!("
+    preCall ~= "_paramTuple[" ~ cbIndex.to!dstring ~ "] = g" ~ containerConvName(param.containerType) ~ "ToD!("
       ~ templateParams ~ ")(cast(" ~ param.containerType.containerTypeCType ~ "*)getVal!(void*)(&_paramVals["
       ~ (paramIndex + 1).to!dstring ~ "]));\n"; // The parameter index is +1 because the first one is the object instance
 
@@ -268,10 +275,7 @@ class SignalWriter
   {
     writer ~= genDocs;
     writer ~= "gulong connect" ~ signal.titleName ~ "(T)(" ~ (signal.detailed ? "string detail = null, "d : "")
-      ~ "T callback, Flag!\"After\" after = No.After)" ~ (moduleType == ModuleType.Iface ? ";"d : "");
-
-    if (moduleType == ModuleType.Iface)
-      return;
+      ~ "T callback, Flag!\"After\" after = No.After) nothrow";
 
     writer ~= ["if (isCallable!T", "&& is(ReturnType!T " ~ (callbackTypes[0].isObject ? ": "d : "== "d) // Add isCallable and ReturnType constraints
       ~ callbackTypes[0].type ~ ")"];
@@ -287,7 +291,7 @@ class SignalWriter
     writer ~= ["&& Parameters!T.length < " ~ callbackTypes.length.to!dstring ~ ")", "{"]; // Ensure there aren't more arguments than expected
 
     writer ~= ["extern(C) void _cmarshal(GClosure* _closure, GValue* _returnValue, uint _nParams," // C marshal function
-      ~ " const(GValue)* _paramVals, void* _invocHint, void* _marshalData)", "{",
+      ~ " const(GValue)* _paramVals, void* _invocHint, void* _marshalData) nothrow", "{",
       "assert(_nParams == " ~ (signal.params.length + 1).to!dstring ~ ", \"Unexpected number of signal parameters\");", // assert C marshal receives expected number of parameters
       "auto _dClosure = cast(DGClosure!T*)_closure;",
       "Tuple!(Parameters!T) _paramTuple;"]; // Create D type parameter tuple
@@ -298,13 +302,20 @@ class SignalWriter
     if (inpProcess.length > 0)
       writer ~= inpProcess;
 
-    writer ~= ["", call];
+    writer ~= ["", "try", "{", call, "}", "catch (Exception e)", "{", // Handle exceptions from D callback
+      `gidInvokeCallbackExceptionHandler(e, "` ~ signal.fullDName ~ `");`, "}"];
 
     if (postCall.length > 0)
       writer ~= postCall;
 
     writer ~= ["}", "", "auto closure = new DClosure(callback, &_cmarshal);"];
-    writer ~= ["return connectSignalClosure(\"" ~ signal.name ~ "\""
+    // Templates in a D interface are not virtual, so the interface definition has its own implementation which
+    // connects to the object instance, allowing a signal to be connected via an interface typed reference
+    if (moduleType == ModuleType.Iface)
+      addImport("gobject.object");
+
+    writer ~= ["return " ~ (moduleType == ModuleType.Iface ? "(cast(gobject.object.ObjectWrap)this)."d : "")
+      ~ "connectSignalClosure(\"" ~ signal.name ~ "\""
       ~ (signal.detailed ? `~ (detail.length ? "::" ~ detail : "")`d : "") ~ ", closure, after);", "}"];
   }
 
@@ -324,7 +335,8 @@ class SignalWriter
     docs ~= ["", "        `" ~ callbackProto ~ "`"];
 
     docs ~= signal.params.filter!(pa => pa.isDParam).map!(pa => [""d] ~ ("        `" ~ pa.dName ~ "` "
-      ~ signal.gdocToDDocFunc(pa.docContent, "          ").stripLeft ~ " (optional)").splitLines).join.array;
+      ~ signal.gdocToDDocFunc(pa.docContent, "          ").stripLeft ~ pa.borrowedArgDoc
+      ~ " (optional)").splitLines).join.array;
 
     docs ~= ["", "        `" ~ signal.signalDelegInstanceParam ~ "`"
       ~ " the instance the signal is connected to (optional)", ""];

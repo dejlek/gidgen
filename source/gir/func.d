@@ -92,6 +92,27 @@ final class Func : TypeNode
     return funcType != FuncType.Method && !isCtor && parent !is repo.globalStruct;
   }
 
+  /// Returns true if the callback has closure data (closure parameter or closure field)
+  @property bool hasClosure()
+  {
+    return closureParam || !closureField.empty;
+  }
+
+  /**
+   * Get a D expression for accessing the closure data from within a C callback trampoline.
+   * Returns: D code expression or null if the callback has no closure
+   */
+  dstring closureExpr()
+  {
+    if (closureParam)
+      return closureParam.dName;
+
+    if (closureFieldParam)
+      return "(cast(" ~ closureFieldParam.cType ~ ")" ~ closureFieldParam.dName ~ ")." ~ closureFieldName;
+
+    return null;
+  }
+
   override void fromXml(XmlNode node)
   {
     super.fromXml(node);
@@ -117,6 +138,90 @@ final class Func : TypeNode
     deprecated_ = node.get("deprecated") == "1";
     deprecatedVersion = node.get("deprecated-version");
     when = cast(SignalWhen)SignalWhenValues.countUntil(node.get("when"));
+    closureField = node.get("gid-closure-field"); // Custom gid attribute set by def rule: "<paramName>.<fieldName>"
+    unmapFunc = node.get("gid-unmap"); // Custom gid attribute set by def rule: C unmap function of a map function
+    mapSourceName = node.get("gid-map-source"); // Custom gid attribute set by def rule: mapped source parameter
+  }
+
+  /**
+   * Get the mapped structure parameter of a map function (see unmapFunc).
+   * Returns: The Out caller allocated Wrap structure parameter, null if none
+   */
+  Param mapParam()
+  {
+    auto found = params.find!(p => p.direction == ParamDirection.Out && p.callerAllocates
+      && p.kind == TypeKind.Wrap);
+    return found.empty ? null : found.front;
+  }
+
+  /**
+   * Get the mapped source parameter of a map function (see mapSourceName).
+   * Returns: The In object or structure parameter named by mapSourceName, null if not set or not found
+   */
+  Param mapSource()
+  {
+    auto found = params.find!(p => p.name == mapSourceName && p.direction == ParamDirection.In
+      && p.kind.among(TypeKind.Opaque, TypeKind.Wrap, TypeKind.Boxed, TypeKind.Reffed, TypeKind.Object));
+    return found.empty ? null : found.front;
+  }
+
+  /**
+   * Get the class which has the MapScope alias of a map function (see unmapFunc): the class of the function, or the
+   * class of the mapped structure for global functions.
+   */
+  Structure mapScopeClass()
+  {
+    auto st = cast(Structure)parent;
+    return st && st.kind != TypeKind.Namespace ? st : cast(Structure)mapParam.typeObject;
+  }
+
+  /// Get the gid.wrap.MapScope template instance type of a map function (see unmapFunc)
+  dstring mapScopeTemplate()
+  {
+    auto source = mapSource;
+    return "gid.wrap.MapScope!(" ~ mapParam.fullDType ~ ", " ~ unmapFunc ~ ", "
+      ~ (source ? source.fullDType : (cast(Structure)parent).fullDType) ~ ")";
+  }
+
+  /**
+   * Get the MapScope alias name of a map function in its mapScopeClass: "MapScope" if all the map functions of the
+   * class use the same MapScope type, otherwise "<FuncName>Scope".
+   */
+  dstring mapScopeName()
+  {
+    auto distinct = mapScopeClass.mapScopeFuncs.map!(f => f.mapScopeTemplate).array.sort.uniq.count;
+    return distinct == 1 ? "MapScope"d : dName.camelCase(true) ~ "Scope";
+  }
+
+  /**
+   * Get the parameter which owns a borrowed structure return value (see ReturnValue.borrowAttr).
+   * Returns: The In object or structure parameter named by the return value "gid-borrow" attribute, null if none
+   */
+  Param returnBorrowOwner()
+  {
+    auto found = params.find!(p => p.name == returnVal.borrowAttr && p.direction == ParamDirection.In
+      && p.kind.among(TypeKind.Opaque, TypeKind.Wrap, TypeKind.Boxed, TypeKind.Reffed, TypeKind.Object));
+    return found.empty ? null : found.front;
+  }
+
+  /**
+   * Get the parameter which owns a borrowed InOut Wrap** callback parameter (see Param.borrowAttr).
+   * Returns: The In object or structure parameter named by the parameter "gid-borrow" attribute, null if none
+   */
+  Param paramBorrowOwner(Param pa)
+  {
+    if (pa.borrowAttr.length == 0)
+      return null;
+
+    auto found = params.find!(p => p.name == pa.borrowAttr && p.direction == ParamDirection.In
+      && p.kind.among(TypeKind.Opaque, TypeKind.Wrap, TypeKind.Boxed, TypeKind.Reffed, TypeKind.Object));
+    return found.empty ? null : found.front;
+  }
+
+  /// Returns true if any callback parameter borrows from this In parameter (see Param.borrowAttr)
+  bool isParamBorrowOwner(Param pa)
+  {
+    return params.canFind!(p => p.borrowAttr == pa.name && p.isBorrowedInOut);
   }
 
   override dstring genDocs()
@@ -127,7 +232,13 @@ final class Func : TypeNode
     auto s = "/**\n    "d ~ gdocToDDocFunc(docContent, "    ").stripLeft ~ "\n";
 
     auto paramDescrs = params.filter!(pa => !(pa.isInstanceParam || pa.isArrayLength || pa.isClosure || pa.isDestroy))
-      .map!(pa => "      " ~ pa.dName ~ " = " ~ gdocToDDocFunc(pa.docContent, "        ").stripLeft).array;
+      .map!(pa => "      " ~ pa.dName ~ " = " ~ gdocToDDocFunc(pa.docContent, "        ").stripLeft
+        ~ pa.borrowedArgDoc
+        ~ (pa.isBorrowedInOut ? Param.borrowedInOutDoc : "")
+        ~ (pa.isInPlaceBoxedArg ? Param.inPlaceBoxedArgDoc : "")
+        ~ (unmapFunc.length > 0 && pa is mapParam ? " (mapped structure scope, unmapped by its `unmap()` or when it goes"
+        ~ " out of scope, use a local variable: `" ~ mapScopeClass.dType ~ "." ~ mapScopeName ~ " " ~ pa.dName ~ ";`)"d
+        : "")).array;
 
     if (!paramDescrs.empty)
     {
@@ -203,14 +314,14 @@ final class Func : TypeNode
 
     if (returnVal)
     {
-      if (returnVal.lengthParamIndex >= 0) // Return array has a length argument?
+      if (returnVal.arrayLengthIndex >= 0) // Return array has a length argument?
       {
         if (hasInstanceParam) // Array length parameter indexes don't count instance parameters
-          returnVal.lengthParamIndex++;
+          returnVal.arrayLengthIndex++;
 
-        if (returnVal.lengthParamIndex < params.length)
+        if (returnVal.arrayLengthIndex < params.length)
         {
-          returnVal.lengthParam = params[returnVal.lengthParamIndex];
+          returnVal.lengthParam = params[returnVal.arrayLengthIndex];
           returnVal.lengthParam.isLengthReturnArray = true;
         }
       }
@@ -242,7 +353,7 @@ final class Func : TypeNode
         closureParam = pa;
     }
 
-    if (funcType == FuncType.Callback && !closureParam)
+    if (funcType == FuncType.Callback && !closureParam && closureField.empty)
     { // Search for closure parameter if it is not explicitly designated
       foreach (pa; params.retro) // Look in reverse, since it is more likely to be an end parameter
       {
@@ -274,10 +385,63 @@ final class Func : TypeNode
 
     void disableFunc(string file, size_t line, string msg, TypeNode errorNode = null)
     {
+      if (active == Active.Unsupported) // Only warn about the first reason a function is disabled
+        return;
+
       active = Active.Unsupported;
       warnWithLoc(file, line, xmlLocation, "Disabling " ~ (funcType == FuncType.Signal ? "signal '" : "function '" )
         ~ fullDName.to!string ~ "': " ~ msg);
       TypeNode.dumpSelectorOnWarning(errorNode ? errorNode : this);
+    }
+
+    if (!closureField.empty)
+    {
+      if (funcType != FuncType.Callback)
+      {
+        disableFunc(__FILE__, __LINE__, "'gid-closure-field' attribute is only valid on callback types");
+        return;
+      }
+
+      if (closureParam)
+      {
+        disableFunc(__FILE__, __LINE__, "callback has both a closure parameter '" ~ closureParam.name.to!string
+          ~ "' and a 'gid-closure-field' attribute");
+        return;
+      }
+
+      auto parts = closureField.findSplit(".");
+      if (parts[0].empty || parts[2].empty || parts[2].canFind('.'))
+      {
+        disableFunc(__FILE__, __LINE__, "invalid 'gid-closure-field' value '" ~ closureField.to!string
+          ~ "', expected '<paramName>.<fieldName>'");
+        return;
+      }
+
+      auto paIndex = params.countUntil!(x => x.name == parts[0]);
+      if (paIndex < 0)
+      {
+        disableFunc(__FILE__, __LINE__, "'gid-closure-field' parameter '" ~ parts[0].to!string ~ "' not found");
+        return;
+      }
+
+      auto pa = params[paIndex];
+      auto st = cast(Structure)pa.typeObjectRoot;
+      if (!st || pa.cType.countStars != 1 || pa.direction != ParamDirection.In)
+      {
+        disableFunc(__FILE__, __LINE__, "'gid-closure-field' parameter '" ~ parts[0].to!string
+          ~ "' must be an input pointer to a structure or class", pa);
+        return;
+      }
+
+      if (!st.fields.canFind!(x => x.name == parts[2]))
+      {
+        disableFunc(__FILE__, __LINE__, "'gid-closure-field' field '" ~ parts[2].to!string ~ "' not found in '"
+          ~ st.fullDName.to!string ~ "'", pa);
+        return;
+      }
+
+      closureFieldParam = pa;
+      closureFieldName = parts[2];
     }
 
     if (!shadows.empty && !shadowsFunc)
@@ -294,6 +458,28 @@ final class Func : TypeNode
       {
         disableFunc(e.file, e.line, "Return type error: " ~ e.msg, returnVal);
         return;
+      }
+
+      if (unmapFunc.length > 0)
+      {
+        if (!mapParam || returnVal.dType != "bool")
+          disableFunc(__FILE__, __LINE__, "'gid-unmap' map function requires a boolean return value and an Out"
+            ~ " caller allocated structure parameter", returnVal);
+        else if (mapSourceName.length > 0 ? !mapSource : funcType != FuncType.Method)
+          disableFunc(__FILE__, __LINE__, "'gid-unmap' map function source must be the instance or an In object or"
+            ~ " structure parameter named by 'gid-map-source'", returnVal);
+      }
+
+      if (returnVal.borrowAttr.length > 0)
+      {
+        auto st = cast(Structure)returnVal.typeObject;
+
+        if (!st || !st.borrowed || returnVal.ownership != Ownership.None)
+          disableFunc(__FILE__, __LINE__, "'gid-borrow' return value requires a borrowed structure type without"
+            ~ " ownership transfer", returnVal);
+        else if (returnVal.borrowAttr != "static" && !returnBorrowOwner)
+          disableFunc(__FILE__, __LINE__, "'gid-borrow' return value owner '" ~ returnVal.borrowAttr.to!string
+            ~ "' is not an In object or structure parameter", returnVal);
       }
     }
 
@@ -325,12 +511,24 @@ final class Func : TypeNode
             return;
           }
         }
+        else if (returnVal.kind == TypeKind.String && returnVal.ownership == Ownership.None)
+        {
+          disableFunc(__FILE__, __LINE__, "callback string return value with transfer none is not supported", returnVal);
+          return;
+        }
+        else if (returnVal.cType.countStars > 0 && (returnVal.kind == TypeKind.StructAlias
+            || (returnVal.kind.among(TypeKind.Struct, TypeKind.Wrap) && returnVal.ownership != Ownership.Full)))
+        { // No D owner can keep a returned structure (Wrap structures are D GC memory) alive for C, only full transfer. Struct and Wrap values can be copied
+          disableFunc(__FILE__, __LINE__, "callback structure pointer return value with ownership '"
+            ~ returnVal.ownership.to!string ~ "' is not supported", returnVal);
+          return;
+        }
       }
     }
 
     if (returnVal)
     {
-      if (returnVal.lengthParamIndex >= 0)
+      if (returnVal.arrayLengthIndex >= 0)
       {
         if (!returnVal.lengthParam) // Return array has invalid length argument?
         {
@@ -344,6 +542,22 @@ final class Func : TypeNode
           return;
         }
       }
+
+      // Arrays of inline structures (not pointers) with full transfer can't be freed generically:
+      // the element free function frees the instance pointer too, and there is no way to clear
+      // just the element contents before freeing the array.
+      with (TypeKind) if (returnVal.containerType == ContainerType.Array
+        && returnVal.ownership == Ownership.Full && returnVal.arrayPtrDepth == 1
+        && returnVal.elemTypes.length == 1 && returnVal.elemTypes[0].kind.among(Opaque, Boxed, Reffed))
+      {
+        disableFunc(__FILE__, __LINE__, "return array of inline '" ~ returnVal.elemTypes[0].kind.to!string
+          ~ "' structures with full ownership is not supported", returnVal);
+        return;
+      }
+
+      with (TypeKind) if (returnVal.containerType == ContainerType.Array && returnVal.ownership != Ownership.None
+        && returnVal.arrayPtrDepth == 1 && returnVal.elemTypes[0].kind == Opaque)
+        disableFunc(__FILE__, __LINE__, "return array of inline Opaque structures with ownership transfer is not supported", returnVal);
     }
 
     foreach (pi, pa; params)
@@ -359,8 +573,78 @@ final class Func : TypeNode
       catch (Exception e)
         disableFunc(e.file, e.line, "Parameter '" ~ pa.name.to!string ~ "' error: " ~ e.msg, pa);
 
+      if (pa.containerType != ContainerType.None && pa.containerType != ContainerType.Array
+          && pa.direction == ParamDirection.In && pa.ownership == Ownership.Container
+          && funcType != FuncType.Callback && funcType != FuncType.Signal)
+        disableFunc(__FILE__, __LINE__, "input container parameter '" ~ pa.name.to!string
+          ~ "' with transfer container is not supported", pa);
+
+      // Out/InOut arrays of inline structures with full transfer can't be freed generically (see return array check)
+      with (TypeKind) if (pa.containerType == ContainerType.Array && pa.direction != ParamDirection.In
+          && pa.ownership == Ownership.Full && pa.elemTypes.length == 1 && pa.elemTypes[0].kind.among(Opaque, Boxed, Reffed)
+          && pa.arrayPtrDepth == (pa.callerAllocates ? 1 : 2))
+        disableFunc(__FILE__, __LINE__, "output array parameter '" ~ pa.name.to!string ~ "' of inline '"
+          ~ pa.elemTypes[0].kind.to!string ~ "' structures with full ownership is not supported", pa);
+
       if (!pa.resolved)
         disableFunc(__FILE__, __LINE__, "Unresolved parameter '" ~ pa.name.to!string ~ "' of type '" ~ pa.dType.to!string ~ "'", pa);
+
+      with (TypeKind) if (funcType == FuncType.Callback)
+      {
+        // InOut instance pointer: full transfer returns a new reference/copy to C, or transfer-none Wrap**
+        // borrowed from another parameter (gid-borrow) which may only be cleared (not replaced)
+        if (pa.direction == ParamDirection.InOut && pa.kind.among(Opaque, Wrap, Boxed, Reffed, Object, Interface))
+        {
+          if (pa.kind == Wrap && pa.ownership == Ownership.None && pa.cType.countStars == 2 && pa.borrowAttr.length > 0)
+          {
+            if (!paramBorrowOwner(pa))
+              disableFunc(__FILE__, __LINE__, "InOut param '" ~ pa.name.to!string ~ "' gid-borrow owner '"
+                ~ pa.borrowAttr.to!string ~ "' not found (requires an In Opaque/Wrap/Boxed/Reffed/Object parameter)", pa);
+          }
+          else if (pa.cType.countStars != 2 || pa.ownership != Ownership.Full)
+            disableFunc(__FILE__, __LINE__, "InOut param '" ~ pa.name.to!string ~ "' of type '" ~ pa.dType.to!string
+              ~ "' in callback with C type '" ~ pa.cType.to!string ~ "' and ownership '" ~ pa.ownership.to!string
+              ~ "' is not supported (requires a pointer to an instance pointer with full ownership, or a Wrap"
+              ~ " parameter with transfer none and a gid-borrow owner)", pa);
+        }
+
+        // Callback output arrays are allocated by the delegate wrapper, so the caller must take full ownership.
+        // InOut arrays and input arrays of inline structures are only supported without ownership transfer.
+        if (pa.containerType == ContainerType.Array && !pa.callerAllocates
+            && ((pa.direction == ParamDirection.Out && pa.ownership != Ownership.Full)
+            || (pa.direction == ParamDirection.InOut && pa.ownership != Ownership.None)
+            || (pa.direction == ParamDirection.In && pa.ownership != Ownership.None && pa.elemTypes.length == 1
+            && pa.elemTypes[0].kind.among(Opaque, Boxed, Wrap, Reffed) && pa.arrayPtrDepth == 1)))
+          disableFunc(__FILE__, __LINE__, pa.direction.to!string ~ " array parameter '" ~ pa.name.to!string
+            ~ "' in callback with ownership '" ~ pa.ownership.to!string ~ "' is not supported", pa);
+
+        // Callback output containers are created by the delegate wrapper, so the caller must take full ownership
+        if (pa.containerType != ContainerType.None && pa.containerType != ContainerType.Array
+            && pa.direction != ParamDirection.In && (pa.direction == ParamDirection.InOut || pa.ownership != Ownership.Full))
+          disableFunc(__FILE__, __LINE__, pa.direction.to!string ~ " container parameter '" ~ pa.name.to!string
+            ~ "' in callback with ownership '" ~ pa.ownership.to!string ~ "' is not supported", pa);
+
+        // No D owner can keep an output structure (Wrap structures are D GC memory) alive for C, only full transfer. Struct and Wrap values can be copied
+        if (pa.direction == ParamDirection.Out && pa.cType.countStars == 2
+            && (pa.kind == StructAlias || (pa.kind.among(Struct, Wrap) && pa.ownership != Ownership.Full)))
+          disableFunc(__FILE__, __LINE__, "Out structure pointer parameter '" ~ pa.name.to!string
+            ~ "' in callback with ownership '" ~ pa.ownership.to!string ~ "' is not supported", pa);
+
+        if (pa.containerType == ContainerType.Array && pa.direction != ParamDirection.In && pa.callerAllocates)
+          disableFunc(__FILE__, __LINE__, "caller allocated output array parameter '" ~ pa.name.to!string
+            ~ "' in callback is not supported", pa);
+      }
+
+      // Delegate wrappers would need to create arrays of a C requested size
+      with (FuncType) if (pa.isArraySize && funcType.among(Callback, Signal))
+        disableFunc(__FILE__, __LINE__, "array size parameter '" ~ pa.name.to!string ~ "' in "
+          ~ funcType.to!string.toLower ~ " is not supported", pa);
+
+      // Signal array parameters are passed as a gpointer, so an element C type can't distinguish inline structures from pointers
+      with (TypeKind) if (funcType == FuncType.Signal && pa.containerType == ContainerType.Array
+          && pa.elemTypes.length == 1 && pa.elemTypes[0].kind.among(Opaque, Boxed, Wrap, Reffed))
+        disableFunc(__FILE__, __LINE__, "signal array parameter '" ~ pa.name.to!string ~ "' of '"
+          ~ pa.elemTypes[0].kind.to!string ~ "' elements is not supported", pa);
 
       // Resolve parameter type aliases to see if any are disabled and disable parameter if so
       for (TypeNode tn = pa.typeObject; tn; tn = typeRepo.typeObjectHash.get((cast(Alias)tn).dType, null))
@@ -386,17 +670,20 @@ final class Func : TypeNode
 
         if (pa.optional || pa.nullable) // optional or nullable set? We treat them the same.
         { // Verify it is a supported parameter type
-          if (pa.direction == ParamDirection.Out)
+          if (pa.direction == ParamDirection.Out
+            || (pa.direction == ParamDirection.InOut && pa.cType.countStars == 2))
           {
             optionalNotOk = true;
             infoWithLoc(__FILE__, __LINE__, pa.xmlLocation, "Optional not supported for parameter '"
-              ~ pa.fullDName.to!string ~ "' with output direction");
+              ~ pa.fullDName.to!string ~ "' with " ~ pa.direction.to!string ~" direction");
           }
           // Note: void* is currently classified as Basic kind due to how GIR represents it.
           // Ideally it should be Pointer kind, but changing this requires broader refactoring.
           // For now, we explicitly check for void* as a special case for optional parameters.
           else with (TypeKind) if (!pa.kind.among(String, Callback, Container, Pointer, Opaque, Wrap, Boxed, Reffed,
-            Object, Interface) && !(pa.kind == Basic && pa.dType.among("void*"d, "const(void)*"d)))
+            Object, Interface) && !(pa.kind == Basic && pa.direction == ParamDirection.In
+            && pa.dType.among("void*"d, "const(void)*"d))
+            && !(pa.kind.among(Struct, StructAlias) && pa.direction == ParamDirection.In && pa.cType.countStars == 1))
           {
             optionalNotOk = true;
             infoWithLoc(__FILE__, __LINE__, pa.xmlLocation, "Optional not supported for parameter '"
@@ -484,8 +771,8 @@ final class Func : TypeNode
       exceptionName = st.origDType;
 
     output = "class " ~ exceptionName ~ "Exception : ErrorWrap\n{\n";
-    output ~= "this(GError* err)\n{\nsuper(err);\n}\n\n";
-    output ~= "this(Code code, string msg)\n{\nsuper(" ~ st.fullDType ~ "." ~ dName ~ ", cast(int)code, msg);\n}\n";
+    output ~= "this(GError* err, Flag!\"Take\" take) nothrow\n{\nsuper(err, take);\n}\n\n";
+    output ~= "this(Code code, string msg) nothrow\n{\nsuper(" ~ st.fullDType ~ "." ~ dName ~ ", cast(int)code, msg);\n}\n";
     output ~= "\nalias Code = " ~ exceptionName ~ "Error;\n}";
 
     return output;
@@ -554,6 +841,7 @@ final class Func : TypeNode
     js.jsonSetNonDefault("returnVal", returnVal);
     js.jsonSetNonDefault("params", params);
     js.jsonSetNonDefault("closureParam", closureParam);
+    js.jsonSetNonDefault("closureField", closureField);
     js.jsonSetNonDefault("isCtor", isCtor);
     if (shadowedByFunc) js["shadowedByFunc"] = shadowedByFunc.fullDName;
     if (shadowsFunc) js["shadowsFunc"] = shadowsFunc.fullDName;
@@ -587,6 +875,11 @@ final class Func : TypeNode
   ReturnValue returnVal; /// Return value type
   Param[] params; /// Parameters
   Param closureParam; /// Closure data parameter or null (Callback only)
+  dstring unmapFunc; /// Custom "gid-unmap" attribute: C function which unmaps the structure filled by this map function (see mapParam)
+  dstring mapSourceName; /// Custom "gid-map-source" attribute: name of the mapped source parameter (instance if not set)
+  dstring closureField; /// Custom "gid-closure-field" attribute "<paramName>.<fieldName>": closure data is read from a C struct field of a callback parameter instead of a closure parameter (Callback only)
+  Param closureFieldParam; /// Resolved parameter for closureField (set in verify)
+  dstring closureFieldName; /// Resolved structure field name for closureField (set in verify)
   bool isCtor; /// Set for the primary constructor of an instance (not a Gir field)
   Func shadowedByFunc; /// Resolved function object for shadowedBy
   Func shadowsFunc; /// Resolved function object for shadows

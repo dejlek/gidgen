@@ -39,6 +39,16 @@ final class Field : TypeNode
     return repo.defs.symbolName(_name.camelCase);
   }
 
+  override bool isPlainData()
+  {
+    if (kind == TypeKind.Container && isStaticArray)
+      return elemTypes[0].kind == TypeKind.Wrap ? elemTypes[0].typeObjectRoot.isPlainData : elemTypes[0].isPlainData;
+    else if (cType.countStars > 0) // Pointers are not plain data (also avoids recursion for linked structures)
+      return false;
+    else
+      return kind == TypeKind.Wrap ? typeObjectRoot.isPlainData : super.isPlainData;
+  }
+
   override void fromXml(XmlNode node)
   {
     super.fromXml(node);
@@ -48,11 +58,8 @@ final class Field : TypeNode
     writable = node.get("writable", "0") == "1";
     introspectable = node.get("introspectable", "1") == "1";
     private_ = node.get("private") == "1";
-
-    try
-      bits = node.get("bits", "0").to!ubyte;
-    catch (ConvException e)
-      warnWithLoc(__FILE__, __LINE__, xmlLocation, "Invalid field bits value '" ~ node.get("bits").to!string ~ "'");
+    owned = node.get("owned", "0") == "1";
+    bits = node.attrTo!ubyte("bits", 0);
   }
 
   protected override void fixup()
@@ -77,6 +84,18 @@ final class Field : TypeNode
     }
     else if (kind == TypeKind.Callback)
       callback = cast(Func)typeObject;
+
+    if (arrayLengthIndex >= 0) // Resolve array field index reference
+    {
+      if (auto st = getParentByType!Structure)
+      {
+        if (arrayLengthIndex < st.fields.length)
+        {
+          lengthField = st.fields[arrayLengthIndex];
+          lengthField.arrayFields ~= this;
+        }
+      }
+    }
   }
 
   protected override void resolve()
@@ -113,7 +132,8 @@ final class Field : TypeNode
     if (kind == TypeKind.String && starCount > 1)
       throw new Exception("Array of strings not supported");
 
-    with(TypeKind) if ((kind.among(Basic, BasicAlias, Enum, Flags, Callback) && starCount != 0)
+    // Basic types can be pointers themselves (gpointer is void*), so compare with the stars of the D type
+    with(TypeKind) if ((kind.among(Basic, BasicAlias, Enum, Flags, Callback) && starCount != dType.countStars)
         || (kind.among(String, StructAlias, Struct, Pointer, Opaque, Wrap, Boxed, Reffed, Object, Interface)
         && starCount > 1))
       throw new Exception("Unexpected number of pointer references for field " ~ fullDName.to!string);
@@ -121,21 +141,70 @@ final class Field : TypeNode
     if (directStruct)
       throw new Exception("Embedded structure fields not supported");
 
-    if (containerType != ContainerType.None)
-      throw new Exception("Container type '" ~ containerType.to!string ~ "' not supported");
+    if (containerType == ContainerType.Array)
+    {
+      auto isScalar = typeKindIsScalar(elemTypes[0].kind);
+      auto elemDStars = isScalar ? elemTypes[0].dType.countStars : 0; // Basic types can be pointers (gpointer is void*)
+      auto elemStars = elemTypes[0].cType.countStars - elemDStars;
+      auto arrayStars = starCount - elemDStars;
+
+      if (arrayLengthIndex >= 0 && (!lengthField || lengthField.cType.countStars > 0)) // Array has invalid length argument?
+        throw new Exception("Invalid array length parameter");
+
+      if (!isStaticArray // Allow fixed size array fields
+          && (arrayStars < 1 || (isScalar && arrayStars > 1) || (!isScalar && arrayStars > 2)))
+        throw new Exception("Array has unexpected C type '" ~ cType.to!string ~ "'");
+
+      if ((isScalar && elemStars > 0) || (!isScalar && elemStars > 1))
+        throw new Exception("Array has unexpected C element type '" ~ elemTypes[0].cType.to!string ~ "'");
+    }
+    else if (containerType != ContainerType.None && starCount != 1)
+      throw new Exception("Invalid container field with type '" ~ containerType.to!string ~ "' and C type '"
+        ~ cType.to!string);
 
     if (kind.among(TypeKind.Unknown, TypeKind.Namespace))
       throw new Exception("Unhandled type '" ~ dType.to!string ~ "' (" ~ kind.to!string ~ ")");
 
     with (TypeKind) if (writable
-      && ((kind.among(Struct, StructAlias) && starCount != 0)  // Writable structure pointer fields are not supported
+      && ((kind == Container && (!isStaticArray || !elemTypes[0].kind.isPlainData)) // Only writable static array plain data field containers are supported
+        || (kind.among(Struct, StructAlias) && starCount != 0)  // Writable structure pointer fields are not supported
         || kind.among(Pointer, Opaque, Wrap) // Unsupported structure types (unknown memory allocation methods)
-        || (kind == Boxed && starCount == 0))) // Non-pointer boxed types not currently supported
+        || (kind.among(Boxed, Reffed) && starCount == 0))) // Embedded boxed/reffed types not supported
     {
       writable = false;
       warnWithLoc(__FILE__, __LINE__, xmlLocation, "Setting writable to false for field '" ~ fullDName.to!string
         ~ "' with unhandled type '" ~ dType.to!string ~ "' (" ~ kind.to!string ~ ")");
       TypeNode.dumpSelectorOnWarning(this);
+    }
+
+    // GIR has no field ownership annotations. Wrap structures borrow pointer field values (kept alive by the D wrapper).
+    // For other structures the C free function determines field ownership, so writable pointer fields are disabled
+    // unless the definitions mark them as owned.
+    with (TypeKind) if (writable && kind.among(String, Boxed, Reffed, Object, Interface) && !owned)
+    {
+      auto st = getParentByType!Structure;
+
+      if (!st || st.kind != Wrap)
+      {
+        writable = false;
+        warnWithLoc(__FILE__, __LINE__, xmlLocation, "Setting writable to false for pointer field '"
+          ~ fullDName.to!string ~ "' of unknown ownership (set 'owned' to 1 in definitions if the structure owns it)");
+        TypeNode.dumpSelectorOnWarning(this);
+      }
+    }
+
+    // Owned field values of a Wrap structure are freed by its free function, which requires a C allocated structure
+    if (owned)
+    {
+      auto st = getParentByType!Structure;
+
+      if (st && st.kind == TypeKind.Wrap && !st.cAllocated)
+      {
+        owned = false;
+        warnWithLoc(__FILE__, __LINE__, xmlLocation, "Ignoring 'owned' for field '" ~ fullDName.to!string
+          ~ "' of Wrap structure without a free-function (not C allocated)");
+        TypeNode.dumpSelectorOnWarning(this);
+      }
     }
 
     if (callback)
@@ -159,14 +228,18 @@ final class Field : TypeNode
     js["introspectable"] = introspectable;
     js["private"] = private_;
     js.jsonSetNonDefault("bits", bits);
+    js.jsonSetNonDefault("owned", owned);
   }
 
   private dstring _name; /// Field name
   Func callback; /// For callback fields (embedded callback type or alias reference)
   Structure directStruct; /// Directly embedded structure or union
+  Field lengthField; /// For array fields to indicate what other field is the array length
+  Field[] arrayFields; /// Array fields which this field is a length for
   bool readable; /// Readable field?
   bool writable; /// Writable field?
   bool introspectable = true; /// Is field introspectable?
   bool private_; /// Private field?
   ubyte bits; /// For C bit fields, number of bits occupied for this field in integer type (or 0 if not a bit field)
+  bool owned; /// Pointer field value is owned by the structure (gidgen extension: set via definitions, enables setters for non-Wrap structures)
 }

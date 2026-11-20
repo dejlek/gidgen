@@ -41,6 +41,7 @@ import xml_tree;
 
 enum DefsCmdPrefix = "//!"d; /// Prefix used for definition commands
 enum DefsCommentPrefix = "//#"d; /// Prefix used for definition comments (not included in content)
+enum DefaultGirPath = "/usr/share/gir-1.0"; /// Default path to search for GIR files
 
 class Defs : Base
 {
@@ -120,8 +121,10 @@ class Defs : Base
       auto defCode = curRepo.modDefCode[curModName];
 
       if (classState == ClassState.Pre) // Not inside class?
-      { // Is this a class declaration?
-        if (line.startsWith("class") || line.startsWith("abstract class"))
+      { // Is this a class declaration? Namespace modules have no class, so any class declarations are pre class code
+        auto kind = curModName in curRepo.kindSubs;
+
+        if ((!kind || *kind != TypeKind.Namespace) && (line.startsWith("class") || line.startsWith("abstract class")))
         {
           defCode.classDecl = line;
           classState = ClassState.Start;
@@ -270,6 +273,8 @@ class Defs : Base
           catch (XmlPatchError e)
             throw new Exception("XML patch error: " ~ e.msg ~ " " ~ posInfo);
 
+          patch.posInfo = posInfo;
+
           if (curRepo)
             curRepo.patches ~= patch;
           else
@@ -371,9 +376,12 @@ class Defs : Base
    * Load gir files specified in the loaded definition files to Repo objects.
    * Params:
    *   girPaths = Array of paths to search for Gir files
+   * Returns: false if any XML patches failed to apply (errors are logged for all of them), true otherwise
    */
-  void loadRepos(string[] girPaths = ["/usr/share/gir-1.0"])
+  bool loadRepos(string[] girPaths = [DefaultGirPath])
   {
+    uint patchErrors;
+
     repos = repos.sort!((x, y) => x.namespace < y.namespace).array;
 
     foreach (repo; repos)
@@ -417,12 +425,28 @@ class Defs : Base
       }
 
       foreach (patch; repo.patches) // Apply XML patches from defs file
-        patch.apply(tree, namespaceNode);
+      {
+        try
+          patch.apply(tree, namespaceNode);
+        catch (XmlPatchError e)
+        {
+          error(e.msg ~ " " ~ patch.posInfo ~ " (Gir file '" ~ repo.filename ~ "')");
+          patchErrors++;
+        }
+      }
 
       repo.fromXmlTree(tree); // Convert XML tree to Gir object tree
     }
 
+    if (patchErrors > 0)
+    {
+      error(patchErrors.to!string ~ " definition XML patch " ~ (patchErrors == 1 ? "command" : "commands")
+        ~ " failed to apply");
+      return false;
+    }
+
     fixupVerifyRepos();
+    return true;
   }
 
   /// Ensure consistent state of repo data and fixup additional data (array parameter indexes, etc)

@@ -128,7 +128,7 @@ final class Repo : Base
           {
             base.docContent = node.content;
             base.docFilename = node.get("filename");
-            base.docLine = node.get("line").to!uint;
+            base.docLine = node.attrTo!uint("line", 0);
           }
           break;
         case "doc-deprecated": // Deprecated note
@@ -143,13 +143,16 @@ final class Repo : Base
         case "docsection": // Documentation section
           docSections ~= new DocSection(this, node);
           break;
+        case "doc:format": // Indicates the doc format (gi-docgen or unknown have been seen), currently ignored
+          break;
         case "field": // Field
           if (auto st = node.baseParentFromXmlNodeWarn!Structure)
             st.fields ~= new Field(st, node);
           break;
         case "function-inline": // Inline function
         case "function-macro": // Function macro
-          goto noRecurse; // Ignore function macros
+        case "method-inline": // Inline method
+          goto noRecurse; // Ignore
         case "glib:boxed":
           break; // Silently ignore this seldom used node (only TreeRowData seen so far)
         case "glib:signal": // Signals (class and interface)
@@ -214,7 +217,7 @@ final class Repo : Base
           if (auto base = node.baseParentFromXmlNodeWarn!Base)
           {
             base.sourceFilename = node.get("filename");
-            base.sourceLine = node.get("line").to!uint;
+            base.sourceLine = node.attrTo!uint("line", 0);
           }
           break;
         case "type": // Type information
@@ -317,12 +320,11 @@ final class Repo : Base
 
       foreach (m; en.members) // Add enum/flag member names
       {
-        // Register by cName when glibName is available (glibName presence indicates valid C symbol).
-        // Fall back to registering by glibName when cName is available.
-        // Both hashes point to the same member for lookup flexibility.
-        if (m.glibName)
+        // Register by C identifier, and also by the GType value name if it differs
+        if (m.cName)
           defs.cSymbolHash[m.cName] = m;
-        else if (m.cName)
+
+        if (m.glibName && m.glibName != m.cName)
           defs.cSymbolHash[m.glibName] = m;
       }
     }
@@ -451,6 +453,23 @@ final class Repo : Base
         TypeNode.dumpSelectorOnWarning(st);
       }
     }
+
+    foreach (al; aliases) // Disable aliases whose aliased type got disabled after the alias was verified
+    {
+      if (al.active != Active.Enabled)
+        continue;
+
+      if (auto aliased = al.aliasedType)
+      {
+        if (aliased.active != Active.Enabled)
+        {
+          al.active = Active.Unsupported;
+          warnWithLoc(__FILE__, __LINE__, al.xmlLocation, "Disabling alias '" ~ (namespace ~ "." ~ al.name).to!string
+            ~ "': Aliased type '" ~ aliased.fullDName.to!string ~ "' is not active");
+          TypeNode.dumpSelectorOnWarning(al);
+        }
+      }
+    }
   }
 
   /**
@@ -512,19 +531,20 @@ final class Repo : Base
   {
     auto className = st.dType ~ "IfaceProxy";
     auto modName = st.moduleName ~ "_iface_proxy";
+    auto ifaces = [st] ~ st.allPrerequisiteIfaces; // Interface and its prerequisite interfaces which are mixed in
     auto writer = new CodeWriter(buildPath(path, modName.to!string ~ ".d"));
     writer ~= ["/// Module for [" ~ className ~ "] interface proxy object",
       "module " ~ packageNamespace ~ "." ~ modName ~ ";", "",
-      "import gobject.object;",
-      "import " ~ st.fullModuleName ~ ";",
-      "import " ~ st.fullModuleName ~ "_mixin;", "",
+      "import gobject.object;"];
+    writer ~= ifaces.map!(x => ["import " ~ x.fullModuleName ~ ";", "import " ~ x.fullModuleName ~ "_mixin;"]).join;
+    writer ~= ["",
       "/// Proxy object for [" ~ st.fullDName ~ "] interface when a GObject has no applicable D binding",
       "class " ~ className ~ " : IfaceProxy, " ~ st.fullDType, "{",
-      "this(void* ptr, Flag!\"Take\" take)", "{", "super(cast(void*)ptr, take);", "}", "",
-      "override TypeInfo_Interface getIface()", "{", "return typeid(" ~ st.fullDType ~ ");", "}", "",
-      "mixin " ~ st.dType ~ "T!();",
-      "}",
-    ];
+      "this(void* ptr, Flag!\"Take\" take) nothrow", "{", "super(cast(void*)ptr, take);", "}", "",
+      "override TypeInfo_Interface getIface() nothrow", "{", "return typeid(" ~ st.fullDType ~ ");", "}", ""];
+    writer ~= "mixin " ~ st.dType ~ "T!();";
+    writer ~= ifaces[1 .. $].map!(x => "mixin " ~ x.fullModuleName ~ "_mixin." ~ x.dType ~ "T!();").array; // Fully qualified, prerequisites can be from other packages
+    writer ~= "}";
 
     writer.write;
   }
@@ -652,7 +672,9 @@ final class Repo : Base
       if (st.kind == TypeKind.Namespace || st.cType.empty)
         continue;
 
-      if (st.fields.length > 0 && !st.opaque && !st.pointer) // Regular structure?
+      // Regular structures, or opaque types opted in with gid-c-layout so caller-allocated Out
+      // parameters can stack-allocate a complete GIR field layout. Others stay incomplete.
+      if (st.fields.length > 0 && !st.pointer && (!st.opaque || st.cLayout))
         st.writeStructDef(writer);
       else if (st.pointer)
       {
@@ -696,7 +718,7 @@ final class Repo : Base
 
     writeSharedLibs(writer);
 
-    writer ~= ["__gshared extern(C)", "{"];
+    writer ~= ["__gshared extern(C) nothrow", "{"];
 
     foreach (st; structs)
     {
@@ -842,26 +864,11 @@ final class Repo : Base
 
   private void writeSharedLibs(CodeWriter writer)
   {
-    dstring[] winLibs, osxLibs, posixLibs;
-
-    foreach (lib; sharedLibrary.split(',')) // Multiple libraries separated by commas
-    { // Example "libatk-1.0.so.0"
-      auto t = lib.split(".so."); // Split example into "libatk-1.0" and "0"
-      auto t2 = t[0].split("."); // Split "libatk-1.0" into "libatk-1" and "0"
-
-      // libatk-1.0-0.dll;atk-1.0-0.dll;atk-1.dll
-      winLibs ~= "\"" ~ t[0] ~ "-" ~ t[1] ~ ".dll;" ~ t[0][3 .. $] ~ "-" ~ t[1] ~ ".dll;" ~ t2[0][3 .. $] ~ ".dll\"";
-      osxLibs ~= "\"" ~ t[0] ~ "." ~ t[1] ~ ".dylib\""; // libatk-1.0.0.dylib
-      posixLibs ~= "\"" ~ lib ~ "\""; // libatk-1.0.so.0
-    }
+    // Split libraries into individual ones (comma separated), strip the lib prefix, change .so. to _
+    auto libsArray = sharedLibrary.splitter(',').map!(s => s.stripLeft("lib").replace(".so.", "_"));
 
     writer ~= [
-      "version(Windows)",
-      "private immutable LIBS = [" ~ winLibs.join(", ") ~ "];",
-      "else version(OSX)",
-      "private immutable LIBS = [" ~ osxLibs.join(", ") ~ "];",
-      "else",
-      "private immutable LIBS = [" ~ posixLibs.join(", ") ~ "];",
+      "private immutable LIBS = [\"" ~ libsArray.join("\", \"") ~ "\"];",
       ""
     ];
   }
@@ -889,9 +896,9 @@ final class Repo : Base
 
     foreach (i, al; aliases.filter!(x => x.active == Active.Enabled).enumerate) // Generate aliases without writing them (to populate import manager)
     {
-      auto st = cast(Structure)al.typeObjectRoot;
+      auto aliased = al.aliasedType;
 
-      if ((al.typeObjectRoot && al.typeObjectRoot.active != Active.Enabled) || (st && st.inModule)) // Skip if target type is disabled or an alias of a type in a module (alias is written as a module in writePackage())
+      if (aliased && aliased.active != Active.Enabled) // Skip if aliased type is disabled
         continue;
 
       if (al.kind == TypeKind.Callback) // Callback aliases should alias to D callback delegates, not C functions
@@ -1429,6 +1436,34 @@ void warnWithLoc(string file, size_t line, string xmlLoc, string message)
 void infoWithLoc(string file, size_t line, string xmlLoc, string message)
 {
   info((Repo.logCodeLoc ? (file ~ ":" ~ line.to!string ~ " ") : "") ~ (Repo.logGirLoc ? (xmlLoc ~ " ") : "") ~ message);
+}
+
+/**
+ * Convert an XML node attribute. Warn and return a default if it is missing or invalid.
+ * Params:
+ *   T = The type to convert to
+ *   node = XML node
+ *   attr = The attribute name
+ *   defVal = The value to use if the attribute is missing or invalid
+ * Returns: The converted attribute value or defVal
+ */
+T attrTo(T)(XmlNode node, dstring attr, T defVal, string file = __FILE__, size_t line = __LINE__)
+{
+  auto pVal = attr in node.attrs;
+
+  if (!pVal)
+    return defVal;
+
+  try
+  {
+    return (*pVal).to!T;
+  }
+  catch (ConvException e)
+  {
+    warnWithLoc(file, line, node.parseFile ~ ":" ~ node.parseLine.to!string,
+      "Invalid '" ~ attr.to!string ~ "' attribute value '" ~ (*pVal).to!string ~ "', using default");
+    return defVal;
+  }
 }
 
 /// Package include

@@ -72,7 +72,7 @@ final class Property : TypeNode
     super.fixup;
 
     if (!introspectable)
-      active = Active.Disabled;
+      active = Active.Ignored;
   }
 
   protected override void verify()
@@ -100,10 +100,14 @@ final class Property : TypeNode
     if (kind == TypeKind.Unknown)
       throw new Exception("Unresolved type for property");
 
+    if (kind == TypeKind.Callback)
+      throw new Exception("Unsupported property of type " ~ kind.to!string);
+
     if (ownership != Ownership.None && ownership != Ownership.Unset)
       throw new Exception("Property ownership '" ~ ownership.to!string ~ "' not supported");
 
-    if (containerType != containerType.None)
+    if (containerType != containerType.None
+        && (containerType != ContainerType.Array || elemTypes[0].kind != TypeKind.String)) // Allow arrays of string (GStrv)
       throw new Exception("Properties with container values not supported");
   }
 
@@ -115,7 +119,7 @@ final class Property : TypeNode
    */
   Func checkGetter(Func f)
   {
-    return (f && f.active == Active.Enabled && f.funcType == FuncType.Method && typeEqual(f.returnVal)
+    return (f && !f.throws && f.active == Active.Enabled && f.funcType == FuncType.Method && typeEqual(f.returnVal)
       && f.params.length == 1 && f.params[0].isInstanceParam) ? f : null;
   }
 
@@ -127,7 +131,7 @@ final class Property : TypeNode
    */
   Func checkSetter(Func f)
   {
-    return (f && f.active == Active.Enabled && f.funcType == FuncType.Method && (!f.returnVal
+    return (f && !f.throws && f.active == Active.Enabled && f.funcType == FuncType.Method && (!f.returnVal
       || f.returnVal.origDType == "none") && f.params.length == 2 && f.params[0].isInstanceParam
       && typeEqual(f.params[1])) ? f : null;
   }

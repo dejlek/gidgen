@@ -8,6 +8,9 @@ import gir.repo;
 import gir.structure;
 import std_includes;
 
+enum CountLength = 4; /// Length to use for object counts (9999 is max)
+enum PercentLength = 5; /// Length to use for percent (99.9%, 100% is used for 100)
+
 /// Class used for generating binding coverage reports
 class Report
 {
@@ -40,9 +43,7 @@ class Report
 
   string generate(ReportFlags flags)
   {
-    enum COUNT_LENGTH = 4; // Length to use for object counts (9999 is max)
-    enum PERCENT_LENGTH = 5; // Length to use for percent (99.9%, 100% is used for 100)
-    enum STATS_LENGTH = (COUNT_LENGTH + 1) * 3 + PERCENT_LENGTH;
+    enum StatsLength = (CountLength + 1) * 3 + PercentLength;
 
     string reportStr = "\n[Report]\n";
 
@@ -62,9 +63,9 @@ class Report
           if (flags & f)
           {
             auto title = f.to!string;
-            auto prependSpaces = (STATS_LENGTH - title.length) / 2;
+            auto prependSpaces = (StatsLength - title.length) / 2;
             reportStr ~= "| " ~ ' '.repeat(prependSpaces).array ~ title
-              ~ ' '.repeat(STATS_LENGTH - prependSpaces - title.length + 1).array;
+              ~ ' '.repeat(StatsLength - prependSpaces - title.length + 1).array;
           }
 
       subHeader ~= "|  Act  Dis  Uns  Perc ".repeat(reportStr.filter!(x => x == '|').walkLength).join;
@@ -82,13 +83,14 @@ class Report
               continue;
 
             auto total = report.objs[cast(int)Active.Enabled][objNdx].length
-              + report.objs[cast(int)Active.Unsupported][objNdx].length; // Don't include explicitly disabled objects in total
+              + report.objs[cast(int)Active.Disabled][objNdx].length
+              + report.objs[cast(int)Active.Unsupported][objNdx].length; // Ignored objects are not included in total
             auto perc = (total > 0 && report.objs[cast(int)Active.Enabled][objNdx].length < total) // Calculate coverage percentage
               ? format("%.1f", (report.objs[cast(int)Active.Enabled][objNdx].length * 100.0) / total) : "100";
 
-            reportStr ~= format("| %*s %*s %*s %*s ", COUNT_LENGTH, report.objs[cast(int)Active.Enabled][objNdx].length,
-              COUNT_LENGTH, report.objs[cast(int)Active.Disabled][objNdx].length,
-              COUNT_LENGTH, report.objs[cast(int)Active.Unsupported][objNdx].length, PERCENT_LENGTH, perc);
+            reportStr ~= format("| %*s %*s %*s %*s ", CountLength, report.objs[cast(int)Active.Enabled][objNdx].length,
+              CountLength, report.objs[cast(int)Active.Disabled][objNdx].length,
+              CountLength, report.objs[cast(int)Active.Unsupported][objNdx].length, PercentLength, perc);
           }
         }
 
@@ -165,6 +167,7 @@ enum ReportFlags
   AllDisabled = Summary | Disabled | Structs | Funcs | Signals | Fields, /// Output report with explicitly disabled object names only
   AllIgnored = Summary | Ignored | Structs | Funcs | Signals | Fields, /// Output report with ignored object names only
   AllUnsupported = Summary | Unsupported | Structs | Funcs | Signals | Fields, /// Output report with unsupported object names only
+  AllUncovered = Summary | Disabled | Unsupported | Structs | Funcs | Signals | Fields, /// Output report with disabled and unsupported object names (API not covered by the binding)
 }
 
 string[] reportFlagDescriptions = [
@@ -181,7 +184,8 @@ string[] reportFlagDescriptions = [
   "Generate a report of all Enabled items", // AllEnabled
   "Generate a report of all Disabled items", // AllDisabled
   "Generate a report of all Ignored items", // AllIgnored
-  "Generate a report of all Unsupported items (default)", // AllUnsupported
+  "Generate a report of all Unsupported items", // AllUnsupported
+  "Generate a report of all Disabled and Unsupported items (default)", // AllUncovered
 ];
 
 void displayReportOptionsHelp()

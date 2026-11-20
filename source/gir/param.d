@@ -2,6 +2,7 @@ module gir.param;
 
 import defs;
 import gir.func;
+import gir.return_value;
 import gir.structure;
 import gir.type_node;
 import std_includes;
@@ -47,12 +48,17 @@ final class Param : TypeNode
     super.kind(kind);
   }
 
-  /// Get direction string (empty for input, "ref " if callerAllocates=1, "out ", or "inout "). Intended for use directly in code generation.
+  /**
+   * Get direction string (empty for input, "ref " for InOut and caller allocated arrays sized by the caller, or
+   * "out "). Caller allocated Out arrays of a fixed size are "out ", since the D wrapper sizes them.
+   * Intended for use directly in code generation.
+   */
   dstring directionStr()
   {
     if (direction == ParamDirection.In)
       return "";
-    else if (callerAllocates && containerType == ContainerType.Array)
+    else if (callerAllocates && containerType == ContainerType.Array
+        && (direction != ParamDirection.Out || fixedSize == ArrayNotFixed))
       return "ref ";
     else if (direction == ParamDirection.Out)
       return "out ";
@@ -63,7 +69,17 @@ final class Param : TypeNode
   /// Is this parameter a length for a return array and/or one or more array parameters
   @property bool isArrayLength()
   {
-    return isLengthReturnArray || lengthArrayParams.length > 0;
+    return (isLengthReturnArray || lengthArrayParams.length > 0) && !isArraySize;
+  }
+
+  /**
+   * Check if this is an array size parameter: a length passed by value which sets the size of a return array or
+   * callee allocated output arrays. It is passed to the D function as a regular input parameter.
+   */
+  @property bool isArraySize()
+  {
+    return cType.countStars == 0 && (isLengthReturnArray || (lengthArrayParams.length > 0
+      && !lengthArrayParams.canFind!(p => p.direction != ParamDirection.Out || p.callerAllocates)));
   }
 
   /**
@@ -72,7 +88,121 @@ final class Param : TypeNode
    */
   @property bool isDParam()
   {
-    return !isInstanceParam && !isLengthReturnArray && lengthArrayParams.length == 0 && !isClosure && !isDestroy;
+    return !isInstanceParam && !isArrayLength && !isClosure && !isDestroy;
+  }
+
+  /**
+   * Is this a callback or signal In parameter of a borrowed structure type (see Structure.borrowed) without ownership
+   * transfer, which D borrows for the duration of the call (wrapper with no owner) instead of copying.
+   */
+  @property bool isBorrowedArg()
+  {
+    auto st = cast(Structure)typeObjectRoot;
+    auto func = getParentByType!Func;
+    return st && st.borrowed && kind == TypeKind.Wrap && containerType == ContainerType.None
+      && direction == ParamDirection.In && ownership == Ownership.None
+      && func && func.funcType.among(FuncType.Callback, FuncType.Signal);
+  }
+
+  /**
+   * Is this a callback or signal In array parameter of borrowed structure type (see Structure.borrowed) elements without
+   * ownership transfer, which D borrows for the duration of the call (element wrappers with no owner) instead of copying.
+   */
+  @property bool isBorrowedArrayArg()
+  {
+    auto st = elemTypes.length == 1 ? cast(Structure)elemTypes[0].typeObjectRoot : null;
+    auto func = getParentByType!Func;
+    return st && st.borrowed && elemTypes[0].kind == TypeKind.Wrap && containerType == ContainerType.Array
+      && direction == ParamDirection.In && ownership == Ownership.None
+      && func && func.funcType.among(FuncType.Callback, FuncType.Signal);
+  }
+
+  /**
+   * Is this a callback In parameter of a boxed type passed as a non-const pointer without ownership transfer (such as a
+   * caller initialized GValue the callback sets). The D wrapper borrows the C instance during the call (Boxed._cBorrow),
+   * so changes made by the delegate are seen by the caller, and takes a copy of it afterwards (Boxed._cUnborrow) in
+   * case the delegate kept a reference (see DelegWriter).
+   */
+  @property bool isInPlaceBoxedArg()
+  {
+    auto func = getParentByType!Func;
+    return kind == TypeKind.Boxed && containerType == ContainerType.None && direction == ParamDirection.In
+      && ownership == Ownership.None && cType.countStars == 1 && !cType.startsWith("const")
+      && func && func.funcType == FuncType.Callback;
+  }
+
+  /// Documentation note appended to in place boxed parameters (see isInPlaceBoxedArg)
+  enum dstring inPlaceBoxedArgDoc = " (modified in place, changes are seen by the caller)";
+
+  /**
+   * Documentation note appended to borrowed parameters (see isBorrowedArg and isBorrowedArrayArg), empty otherwise.
+   * Suggests `_dup` only for structures with a copy function, since `_dup` of other borrowed structures is a shallow
+   * copy whose pointer fields still reference the borrowed C memory.
+   */
+  @property dstring borrowedArgDoc()
+  {
+    if (!isBorrowedArg && !isBorrowedArrayArg)
+      return "";
+
+    // Cast each branch, LDC 1.42 fails on a class cast of a conditional expression (ldc-developers/ldc#5079)
+    auto st = isBorrowedArrayArg ? cast(Structure)elemTypes[0].typeObjectRoot : cast(Structure)typeObjectRoot;
+    return " (borrowed, only valid during the callback" ~ (st && st.copyFunction.length > 0
+      ? ", use `_dup` to keep a copy)"d : ")"d);
+  }
+
+  /**
+   * Is this a callback InOut Wrap** parameter borrowed from another parameter named by borrowAttr
+   * (transfer none). The D delegate takes `ref T`; null removes the value, a different non-null pointer is a
+   * programmer error (see DelegWriter).
+   */
+  @property bool isBorrowedInOut()
+  {
+    auto st = cast(Structure)typeObjectRoot;
+    auto func = getParentByType!Func;
+    return st && st.borrowed && kind == TypeKind.Wrap && containerType == ContainerType.None
+      && direction == ParamDirection.InOut && ownership == Ownership.None && cType.countStars == 2
+      && borrowAttr.length > 0 && func && func.funcType == FuncType.Callback;
+  }
+
+  /// Documentation note appended to borrowed InOut parameters (see isBorrowedInOut)
+  enum dstring borrowedInOutDoc = " (borrowed from the owner named by definitions; set to `null` to remove,"
+    ~ " replacing with a different instance is a programmer error)";
+
+  /**
+   * Caller-allocated Out of an opaque boxed type with a complete GIR layout (gid-c-layout) and
+   * transfer none. These are stack-allocated and copied with boxedCopy; other boxed outs keep boxedNew.
+   */
+  @property bool isOpaqueBoxedStackOut()
+  {
+    auto st = cast(Structure)typeObject;
+    return kind == TypeKind.Boxed && direction == ParamDirection.Out && callerAllocates
+      && ownership == Ownership.None && !cTypeRemPtr.endsWith('*')
+      && st && st.opaque && st.cLayout && !st.pointer && st.fields.length > 0;
+  }
+
+  /**
+   * Caller-allocated Out structure which the wrapper allocates on the heap before the call (boxedNew for boxed types
+   * other than isOpaqueBoxedStackOut, g_malloc0 for Wrap types with initOwnsMembers) and which is only taken by the D
+   * object after the call. It must be freed (with the type's _cFree) if the call fails with an error.
+   */
+  @property bool isHeapCallerAllocOut()
+  {
+    auto st = cast(Structure)typeObject;
+    auto func = getParentByType!Func;
+    return active != Active.Ignored && !isInstanceParam && !isArrayLength && containerType == ContainerType.None
+      && direction == ParamDirection.Out && callerAllocates && !cTypeRemPtr.endsWith('*') && !(st && st.pointer)
+      && !(func && func.unmapFunc.length > 0 && this is func.mapParam)
+      && ((kind == TypeKind.Boxed && !isOpaqueBoxedStackOut) || (kind == TypeKind.Wrap && st && st.initOwnsMembers));
+  }
+
+  /**
+   * Check if a parameter can fully transfer its memory to another user.
+   * Returns: true if parameter can be fully transferred, false otherwise
+   */
+  @property bool canTransferFull()
+  {
+    auto st = cast(Structure)typeObject;
+    return !kind.among(TypeKind.Opaque, TypeKind.Wrap) || (st && st.copyFunction);
   }
 
   override void fromXml(XmlNode node)
@@ -87,18 +217,11 @@ final class Param : TypeNode
     optional = node.get("optional") == "1";
     allowNone = node.get("allow-none") == "1";
     callerAllocates = node.get("caller-allocates") == "1";
+    borrowAttr = node.get("gid-borrow"); // Custom gid attribute set by def rule (see borrowAttr)
+    validIfReturn = node.get("gid-valid-if-return") == "1"; // Custom gid attribute (see validIfReturn)
     varargs = node.findChild("varargs") !is null;
-
-    if (auto pVal = "closure" in node.attrs)
-      closureIndex = (*pVal).to!int;
-    else
-      closureIndex = NoClosure;
-
-    if (auto pVal = "destroy" in node.attrs)
-      destroyIndex = (*pVal).to!int;
-    else
-      destroyIndex = NoDestroy;
-
+    closureIndex = node.attrTo!int("closure", NoClosure);
+    destroyIndex = node.attrTo!int("destroy", NoDestroy);
     scope_ = cast(ParamScope)ParamScopeValues.countUntil(node.get("scope"));
   }
 
@@ -119,21 +242,21 @@ final class Param : TypeNode
       elemTypes.length = 0;
     }
 
-    if (lengthParamIndex >= 0)
+    if (arrayLengthIndex >= 0)
     {
       if (func.hasInstanceParam) // Instance parameters don't count towards index
-        lengthParamIndex++;
+        arrayLengthIndex++;
 
-      if (lengthParamIndex < func.params.length)
+      if (arrayLengthIndex < func.params.length)
       {
-        lengthParam = func.params[lengthParamIndex];
+        lengthParam = func.params[arrayLengthIndex];
 
         // gidgen extension which allows other zero terminated arrays to be used for length, should not have lengthArrayParams assigned for the reference array
         if (lengthParam.containerType != ContainerType.Array)
           lengthParam.lengthArrayParams ~= this;
       }
     }
-    else if (lengthParamIndex == ArrayLengthReturn) // Array parameter uses return value as length
+    else if (arrayLengthIndex == ArrayLengthReturn) // Array parameter uses return value as length
     {
       lengthReturn = func.returnVal;
       lengthReturn.lengthArrayParams ~= this;
@@ -218,15 +341,34 @@ final class Param : TypeNode
     if (kind == TypeKind.Unknown)
       throw new Exception("Unresolved type for parameter '" ~ fullDName.to!string ~ "'");
 
-    if (containerType != ContainerType.None)
+    if (direction == ParamDirection.In && ownership == Ownership.Full && !canTransferFull)
+      throw new Exception("Unsupported input " ~ kind.to!string
+        ~ " parameter with full ownership transfer and no copy function");
+
+    if (containerType != ContainerType.None && ownership != Ownership.None)
     {
-      if ((direction == ParamDirection.In || direction == ParamDirection.InOut) && ownership != Ownership.None)
-        throw new Exception("Container " ~ containerType.to!string ~ " parameter with direction "
-          ~ direction.to!string ~ " ownership " ~ ownership.to!string ~ " not supported");
+      if (containerType == ContainerType.Array)
+      {
+        if (direction == ParamDirection.In && ownership == Ownership.Container)
+          throw new Exception("Array input parameter Container ownership not supported");
+
+        with (TypeKind) if (direction == ParamDirection.In && (elemTypes[0].kind.among(Pointer, Opaque)
+            || (elemTypes[0].kind == Wrap && !elemTypes[0].typeObjectRoot.isPlainData)))
+          throw new Exception("Array input " ~ elemTypes[0].kind.to!string ~ " parameter Full ownership not supported");
+      }
+
+      with (TypeKind) if (direction == ParamDirection.InOut && (containerType != ContainerType.Array
+          || (ownership != Ownership.Full || callerAllocates
+          || !elemTypes[0].kind.among(Basic, BasicAlias, Enum, Flags, String))))
+        throw new Exception("Container " ~ containerType.to!string ~ " parameter with direction InOut ownership "
+          ~ ownership.to!string ~ " not supported");
     }
 
     with (TypeKind) if (containerType == ContainerType.None && kind.among(Basic, BasicAlias, Enum, Flags))
     {
+      if (isArraySize) // GIR can mark array sizes as out, but they are inputs passed by value
+        direction = ParamDirection.In;
+
       if (direction == ParamDirection.In && cType.countStars > 0 && cType != "void*" && cType != "const(void)*")
         throw new Exception("Basic input parameter type '" ~ dType.to!string ~ "' has unexpected C type '"
           ~ cType.to!string ~ "'");
@@ -248,21 +390,34 @@ final class Param : TypeNode
       callerAllocates = true;
     }
 
+    with (TypeKind) if (direction == ParamDirection.In && containerType == ContainerType.None
+        && kind.among(Opaque, Wrap, Boxed, Reffed, Object, Interface) && cType.countStars == 2)
+      throw new Exception("Input " ~ kind.to!string ~ " parameter has pointer-to-pointer C type '"
+        ~ cType.to!string ~ "' (missing out/inout annotation?)");
+
     if (direction == ParamDirection.InOut)
     {
-      if (kind == TypeKind.String)
-        throw new Exception("Unsupported string InOut parameter");
+      // InOut Wrap** with transfer none is allowed when definitions name the owner with gid-borrow
+      // (see Func.verify and DelegWriter); other Wrap/Opaque pointer InOut remains unsupported
+      with (TypeKind) if (kind.among(Opaque, Wrap) && cType.countStars == 2
+          && !(kind == Wrap && ownership == Ownership.None && borrowAttr.length > 0))
+        throw new Exception("Unsupported InOut " ~ kind.to!string ~ " pointer parameter (unknown memory management)");
 
-      // Ownership other than None does not make sense for InOut parameters
-      if (ownership != Ownership.None)
+      bool isPtrInOut; // Pointer to an object/struct/string pointer, GIR transfer applies to both directions
+      with (TypeKind) isPtrInOut = kind.among(String, Struct, Boxed, Reffed, Object, Interface) && cType.countStars == 2;
+
+      // Ownership other than None does not make sense for other InOut non-container parameters
+      if (ownership != Ownership.None && !isPtrInOut && containerType == ContainerType.None)
       {
         info("Changing InOut parameter '" ~ fullDName.to!string ~ "' with ownership '" ~ ownership.to!string
           ~ "' to None");
         ownership = Ownership.None;
       }
 
-      // Identify incorrect caller-allocates=0 for structured types, warn, and set callerAllocates to true
-      with (TypeKind) if (!callerAllocates && cType.countStars == 1 && kind.typeKindIsStructured)
+      // Identify incorrect caller-allocates=0 for structured types and C arrays passed by a single pointer (the
+      // callee can only modify them in place) and set callerAllocates to true
+      with (TypeKind) if (!callerAllocates && cType.countStars == 1
+        && (kind.typeKindIsStructured || containerType == ContainerType.Array))
       {
         info("Changing InOut parameter '" ~ fullDName.to!string ~ "' caller-allocates to true");
         callerAllocates = true;
@@ -273,17 +428,28 @@ final class Param : TypeNode
     {
       auto st = cast(Structure)typeObject;
 
-      if (!st || (!st.ctorFunc && (st.opaque || st.pointer || st.fields.empty)))
+      // Pointer typedefs and field-less opaques cannot be caller-allocated. An opaque boxed type
+      // also needs gid-c-layout so writeCTypes emits a complete C struct for stack allocation.
+      if (!st || (!st.ctorFunc && (st.pointer || st.fields.empty)))
         throw new Exception("Unsupported boxed type Out parameter of type '" ~ dType.to!string
           ~ "' requiring caller allocation of opaque structure");
     }
 
+    if (validIfReturn)
+    {
+      auto fn = getParentByType!Func;
+      if (!isOpaqueBoxedStackOut || !fn || !fn.returnVal || fn.returnVal.active != Active.Enabled
+          || fn.returnVal.dType != "bool")
+        throw new Exception("'gid-valid-if-return' is only valid on a transfer-none caller-allocated Out"
+          ~ " of an opaque boxed type with gid-c-layout, on a function that returns a boolean");
+    }
+
     if (containerType == ContainerType.Array) with (ParamDirection)
     {
-      if (lengthParamIndex == ArrayLengthReturn && (!lengthReturn || lengthReturn.kind != TypeKind.Basic))
+      if (arrayLengthIndex == ArrayLengthReturn && (!lengthReturn || lengthReturn.kind != TypeKind.Basic))
         throw new Exception("Invalid return value for array length");
 
-      if (lengthParamIndex >= 0 && !lengthParam) // Array has invalid length argument?
+      if (arrayLengthIndex >= 0 && !lengthParam) // Array has invalid length argument?
         throw new Exception("Invalid array length parameter index");
 
       if (direction == In)
@@ -324,14 +490,19 @@ final class Param : TypeNode
             if (!lengthParam.zeroTerminated || lengthParam.direction != In)
               throw new Exception("Using another array for length requires that it is a zero terminated input array");
           }
-          else if (lengthParam && lengthParam.direction != Out)
+          else if (lengthParam && lengthParam.direction != Out && !lengthParam.isArraySize)
             throw new Exception("Callee allocated output array has unsupported length parameter direction '"
               ~ lengthParam.direction.to!string ~ "'");
         }
       }
       else if (direction == InOut)
       {
-        if (!callerAllocates)
+        if (ownership == Ownership.Full)
+        {
+          if (callerAllocates)
+            throw new Exception("InOut caller allocated arrays cannot be ownership Full");
+        }
+        else if (!callerAllocates)
           throw new Exception("InOut arrays must be caller allocated");
         else if (ownership != Ownership.None)
           throw new Exception("InOut arrays cannot be ownership " ~ ownership.to!string);
@@ -369,9 +540,26 @@ final class Param : TypeNode
       if (closureParam.direction != ParamDirection.In || closureParam.dType != "void*")
         throw new Exception("Closure data should be a void* input parameter");
 
-      auto closureCount = (cast(Func)typeObjectRoot).params.count!(x => x.isClosure);
-      if (closureCount != 1)
-        throw new Exception("Parameter callback must have one closure argument");
+      auto cbType = cast(Func)typeObjectRoot;
+      auto closureCount = cbType.params.count!(x => x.isClosure);
+
+      if (!cbType.closureField.empty)
+      { // Closure data is read from a structure field of a callback parameter (gid-closure-field attribute)
+        if (closureCount != 0)
+          throw new Exception("Callback type '" ~ cbType.name.to!string
+            ~ "' has a 'gid-closure-field' attribute and also a closure (user_data) parameter");
+
+        auto fieldParamName = cbType.closureField.findSplit(".")[0];
+        if (!cbType.params.canFind!(x => x.name == fieldParamName))
+          throw new Exception("Callback type '" ~ cbType.name.to!string ~ "' 'gid-closure-field' parameter '"
+            ~ fieldParamName.to!string ~ "' not found");
+      }
+      else if (closureCount == 0)
+        throw new Exception("Callback type '" ~ cbType.name.to!string
+          ~ "' has no closure (user_data) parameter (use a 'gid-closure-field' def rule if the closure data is stored in a structure field)");
+      else if (closureCount > 1)
+        throw new Exception("Callback type '" ~ cbType.name.to!string ~ "' has " ~ closureCount.to!string
+          ~ " closure (user_data) parameters, only one is supported");
 
       if (destroyIndex != NoDestroy)
       {
@@ -389,9 +577,9 @@ final class Param : TypeNode
       throw new Exception("Parameter without a closure has a destroy notify");
 
     if (auto cb = cast(Func)typeObjectRoot)
-      if (!isDestroy && !cb.closureParam && scope_ != ParamScope.Call)
-        throw new Exception ("Callback parameters with scope '" ~ scope_.to!string
-          ~ "' should have a closure parameter");
+      if (!isDestroy && scope_ != ParamScope.Call && (!cb.hasClosure || closureIndex == NoClosure))
+        throw new Exception("Callback parameters with scope '" ~ scope_.to!string
+          ~ "' should have a closure parameter (callback type '" ~ cb.name.to!string ~ "')");
   }
 
   override void toJson(ref JSONValue js)
@@ -411,6 +599,7 @@ final class Param : TypeNode
     js.jsonSetNonDefault("optional", optional);
     js.jsonSetNonDefault("allowNone", allowNone);
     js.jsonSetNonDefault("callerAllocates", callerAllocates);
+    js.jsonSetNonDefault("validIfReturn", validIfReturn);
     js.jsonSetNonDefault("varargs", varargs);
     js.jsonSetNonDefault("isClosure", isClosure);
     js.jsonSetNonDefault("isDestroy", isDestroy);
@@ -425,11 +614,15 @@ final class Param : TypeNode
   bool isLengthReturnArray; /// true if this is a length parameter for a return array
   bool isOptional; /// Set to true if GIR optional is set and all D params following are also isOptional
   Param[] lengthArrayParams; /// Array parameters which use this one as a length
+  Param lengthParam; /// If this is an array parameter, this can be set to an array length parameter
+  ReturnValue lengthReturn; /// Set to length return value for arrays
   ParamDirection direction; /// Parameter direction
   bool nullable; /// Nullable pointer (treated as "optional"), null is always passed as is to C functions
   bool optional; /// Optional pointer
   bool allowNone; /// Allow none (deprecated and replaced with nullable and optional, ignored)
   bool callerAllocates; /// Caller allocates value
+  dstring borrowAttr; /// Custom "gid-borrow" attribute: owning In parameter name of a borrowed InOut Wrap** (Callback)
+  bool validIfReturn; /// Custom "gid-valid-if-return" attribute: wrap a caller-allocated Out only if the function returned true
   bool varargs; /// Indicates a parameter is a varargs ... elipsis
   bool isClosure; /// Is this a closure user_data parameter?
   bool isDestroy; /// Is this a destroy notification callback parameter?
