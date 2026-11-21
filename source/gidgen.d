@@ -6,6 +6,7 @@ import std.getopt;
 import std.path : absolutePath, asNormalizedPath;
 import std.stdio : writeln;
 
+import cli;
 import code_traps;
 import code_writer;
 import defs;
@@ -38,15 +39,20 @@ int main(string[] args)
   bool dumpJson;
   bool dumpJsonWithDocs;
   bool suggest;
+  string configOption;
+  DependencyConfig[] dependencies;
+  auto origArgs = args.dup;
 
   try
   {
     auto helpInformation = getopt(
         args,
-        "d|defs", "Add a path to a directory of binding definition files or a single file (one or more required)", &defPaths,
-        "g|gir-path", "Add a path to search for GIR files (one or more required)", &girPaths,
-        "p|pkg-path", "Top-level package binding output path (required)", &pkgPath,
-        "s|subpkg-path", "Subpackage path to write individual library packages to (required)", &subPkgPath,
+        "d|defs", "Add a path to a directory of binding definition files or a single file (default: " ~ DefaultDefsPath ~ "/)", &defPaths,
+        "g|gir-path", "Add a path to search for GIR files (default: " ~ DefaultGirDir ~ "/ if present, otherwise " ~ DefaultGirPath ~ ")", &girPaths,
+        "p|pkg-path", "Top-level package binding output path (default: " ~ DefaultPkgPath ~ ")", &pkgPath,
+        "s|subpkg-path", "Subpackage path to write individual library packages to (default: " ~ DefaultSubPkgPath ~ "/)", &subPkgPath,
+        "config", "Read options from a JSON config file (defaults to " ~ DefaultConfigName
+          ~ " in the current directory if present)", &configOption,
         "def-help", "Display binding definition file command help", &defHelp,
         "log-level", "Log level (" ~ [EnumMembers!LogLevel].map!(x => x.to!string).join(", ") ~ ")", &logLevel,
         "log-gir-locs", "Log GIR file locations in warnings", &Repo.logGirLoc,
@@ -106,21 +112,31 @@ int main(string[] args)
     return 1;
   }
 
-  if (girPaths.empty)
+  string configPath;
+  if (auto err = resolveConfigPath(configOption, configPath))
   {
-    error("At least one --gir-path (-g) option is required");
+    error(err);
     return 1;
   }
 
-  if (!pkgPath)
+  if (configPath)
   {
-    error("A package output path must be specified with --pkg-path (-p)");
-    return 1;
+    GidgenConfig cfg;
+    if (auto err = loadGidgenConfig(configPath, cfg))
+    {
+      error(err);
+      return 1;
+    }
+
+    dependencies = cfg.dependencies;
+
+    applyGidgenConfig(cfg, cliFlagsFromArgs(origArgs), defPaths, girPaths, pkgPath, subPkgPath, enableReport,
+        reportFile, reportOptions, logLevel, Repo.logGirLoc, Repo.logCodeLoc, suggest);
   }
 
-  if (!subPkgPath)
+  if (auto err = applyPathDefaults(defPaths, girPaths, pkgPath, subPkgPath))
   {
-    error("A sub-package output path must be specified with --subpkg-path (-s)");
+    error(err);
     return 1;
   }
 
@@ -161,9 +177,29 @@ int main(string[] args)
   }
 
   auto defs = new Defs();
-  defs.loadDefFiles(defPaths);
-  if (!defs.loadRepos(girPaths))
+
+  try
+  {
+    defs.loadDefFiles(defPaths);
+
+    foreach (depCfg; dependencies)
+    {
+      auto dep = new Dependency;
+      dep.name = depCfg.name;
+      dep.version_ = depCfg.version_;
+      dep.defPaths = depCfg.defPaths;
+      dep.girPaths = depCfg.girPaths;
+      defs.loadDependencyDefs(dep);
+    }
+
+    if (!defs.loadRepos(girPaths))
+      return 1;
+  }
+  catch (DependencyError e)
+  {
+    error(e.msg);
     return 1;
+  }
 
   if (dumpJson || dumpJsonWithDocs)
   {

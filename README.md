@@ -67,10 +67,11 @@ Command line help reference is produced with the `--help` command argument:
 ```sh
 ./gidgen --help
 GObject Introspection Dlang binding generator
--d           --defs Add a path to a directory of binding definition files or a single file (one or more required)
--g       --gir-path Add a path to search for GIR files (one or more required)
--p       --pkg-path Top-level package binding output path (required)
--s    --subpkg-path Subpackage path to write individual library packages to (required)
+-d           --defs Add a path to a directory of binding definition files or a single file (default: defs/)
+-g       --gir-path Add a path to search for GIR files (default: gir/ if present, otherwise /usr/share/gir-1.0)
+-p       --pkg-path Top-level package binding output path (default: .)
+-s    --subpkg-path Subpackage path to write individual library packages to (default: packages/)
+          --config Read options from a JSON config file (defaults to gidgen.json in the current directory if present)
          --def-help Display binding definition file command help
         --log-level Log level (all, trace, info, warning, error, critical, fatal, off)
      --log-gir-locs Log GIR file locations in warnings
@@ -93,11 +94,81 @@ GObject Introspection Dlang binding generator
 
 These are basic commands which are used for general use cases.
 
-* **-d, --defs**: Add a path to a directory of giD binding definition files or a single file. Option is required and can be specified multiple times.
-* **-g, --gir-path**: Add a path to the GIR search path. This option is required and can be specified multiple times.
+* **-d, --defs**: Add a path to a directory of giD binding definition files or a single file. Can be specified multiple times.
+  Defaults to **defs/** if that directory exists.
+* **-g, --gir-path**: Add a path to the GIR search path. Can be specified multiple times.
+  Defaults to **gir/** if that directory exists, otherwise **/usr/share/gir-1.0**.
+* **-p, --pkg-path**: Top-level package binding output path. Defaults to the current directory (**.**).
+* **-s, --subpkg-path**: Subpackage path to write individual library packages to. Defaults to **packages/**.
 * **--log-level**: Set the output log level. Can be one of: all, trace, info, warning, error, critical, fatal, or off.
   The default value is **warning**. A value of **info** can be used to display useful information about automatic binding decisions,
   which are potentially problematic.
+* **--config**: Read options from a JSON config file. If this option is given, the file must exist.
+  If it is omitted, **gidgen.json** in the current directory is used when that file exists.
+
+### Configuration File
+
+Options can be stored in a **gidgen.json** file so that a repo can be generated with `gidgen` and few or no flags.
+Command line flags override the config file, and the config file overrides the path defaults described above.
+
+Relative paths in the config are resolved relative to the configuration file's directory, so `gidgen --config path/to/gidgen.json`
+works even if it is not run from that directory. The following keys are supported (path keys that correspond to repeatable
+flags accept a string or an array of strings):
+
+* **defs**, **gir-path**, **pkg-path**, **subpkg-path**
+* **report**, **report-file**, **report-options**
+* **log-level**, **log-gir-locs**, **log-code-locs**, **suggest**
+
+An unknown key is an error. The **dependencies** key is described below.
+
+### External Dependency Repositories
+
+A binding repository can depend on the packages of another giD repository, for example a **gid_apache** repository of the
+Apache Arrow and Parquet bindings which uses the glib2, gio2, etc. packages of the main giD repository instead of
+containing them. The **dependencies** key in the config file lists the other repositories:
+
+```json
+{
+  "dependencies": [
+    { "name": "gid", "defs": "gid/defs", "gir": "gid/gir", "version": "~>0.9.15" }
+  ]
+}
+```
+
+* **name**: Dub package name of the dependency's top-level package. Optional, defaults to the global `//!info name` of its defs.
+* **defs**: Definition file or directory path (string or array of strings). Required.
+* **gir**: Directory to search for the GIR files of the dependency (string or array of strings). Required.
+* **version**: Dub version constraint used in package dependencies (defaults to `*`).
+
+Relative paths are resolved relative to the config file's directory.
+
+The definition files and GIRs of the dependency are loaded so that types, GIR includes, and `//!merge` commands resolve
+exactly as they do in the dependency repository, but its packages are *external*:
+they are not written, are not listed in the top-level dub.json, are left out of the README.md and the `--report`, and package dependencies on them are written
+as `"gid:glib2": "~>0.9.15"` (dependency name and version) rather than with the name of the repository being generated.
+The packages of the repository itself keep its own top-level name (for example `"gid_apache:arrow19"`).
+
+Notes and restrictions:
+
+* The repository's defs need a global `//!info name` (and description, etc.) which is different from the dependency names.
+  The global `//!info` values of the dependency are not used for the repository.
+* Global rules in the dependency defs (reserved words, type substitutions, XML patches) apply to the whole run, so the repository's defs
+  should only add rules for its own packages.
+* The dependency defs must not define a namespace or package name which the repository also defines (this is an error),
+  nor may a package of one be merged into a package of the other.
+* All defs of the dependency and the GIRs they name are loaded, even those which the repository does not use.
+* The dependencies are only configurable in the config file, there is no command line form.
+
+```json
+{
+  "defs": "defs",
+  "gir-path": "gir",
+  "pkg-path": ".",
+  "subpkg-path": "packages",
+  "report": true,
+  "report-file": "report.txt"
+}
+```
 
 ### Report Commands
 
